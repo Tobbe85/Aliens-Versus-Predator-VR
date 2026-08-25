@@ -1,4 +1,6 @@
 platform/android/.idea/
+platform/android/app/.idea/
+platform/android/app/quest/
 # CMake build trees for the Linux target (build-linux.sh). The finished binaries go
 # to build/linux/<arch>/, which has its own .gitignore.
 .build-linux/

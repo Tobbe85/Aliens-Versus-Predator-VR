@@ -502,6 +502,10 @@ typedef struct {
     XrExtent2Di                    size;
 } VRSwapchain;
 
+enum VrHeadset { PICO, QUEST };
+
+enum VrHeadset vr_headset;
+
 VRSwapchain *vr_swapchains = NULL;
 /* Dedicated swapchain for the 2D menu quad layer. Kept separate from the per-eye
  * swapchains because those are rendered with MSAA (glFramebufferTexture2DMultisample)
@@ -913,6 +917,13 @@ static bool init_xr_instance(void)
     (*env)->GetJavaVM(env, &vm);
     jobject activity = (jobject)SDL_GetAndroidActivity();
 
+    jclass buildClass = (*env)->FindClass(env, "android/os/Build");
+    jfieldID manufacturerField = (*env)->GetStaticFieldID(env, buildClass, "MANUFACTURER", "Ljava/lang/String;");
+    jstring manufacturer = (jstring)(*env)->GetStaticObjectField(env, buildClass, manufacturerField);
+    const char* mfr = (*env)->GetStringUTFChars(env, manufacturer, NULL);
+    vr_headset = strcmp(mfr, "Pico") == 0 ? PICO : QUEST;
+    (*env)->ReleaseStringUTFChars(env, manufacturer, mfr);
+
     XrInstanceCreateInfoAndroidKHR android_info = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
     android_info.applicationVM       = vm;
     android_info.applicationActivity = activity;
@@ -1187,21 +1198,28 @@ static bool init_xr_session(void)
         /* Suggest bindings for Touch controller profile */
         XrPath profile_path, left_stick_path, right_stick_path, x_path, y_path, menu_path;
         XrPath left_grip_path, right_grip_path, right_trigger_path, right_squeeze_path, a_path, left_stick_click_path, b_path, right_stick_click_path, left_trigger_path, left_squeeze_path, right_haptic_path, left_haptic_path;
-        pfn_xrStringToPath(xr_instance, "/interaction_profiles/oculus/touch_controller", &profile_path);
+        if (vr_headset == QUEST) {
+            pfn_xrStringToPath(xr_instance, "/interaction_profiles/oculus/touch_controller", &profile_path);
+            pfn_xrStringToPath(xr_instance, "/user/hand/left/input/trigger",       &left_trigger_path);
+            pfn_xrStringToPath(xr_instance, "/user/hand/right/input/trigger",      &right_trigger_path);
+            pfn_xrStringToPath(xr_instance, "/user/hand/left/input/menu/click",    &menu_path);
+        } else if (vr_headset == PICO) {
+            pfn_xrStringToPath(xr_instance, "/interaction_profiles/pico/neo3_controller", &profile_path);
+            pfn_xrStringToPath(xr_instance, "/user/hand/left/input/trigger/click", &left_trigger_path);
+            pfn_xrStringToPath(xr_instance, "/user/hand/right/input/trigger/click",&right_trigger_path);
+            pfn_xrStringToPath(xr_instance, "/user/hand/left/input/back/click",    &menu_path);
+        }
         pfn_xrStringToPath(xr_instance, "/user/hand/left/input/thumbstick",        &left_stick_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/right/input/thumbstick",       &right_stick_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/left/input/x/click",           &x_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/left/input/y/click",           &y_path);
-        pfn_xrStringToPath(xr_instance, "/user/hand/left/input/menu/click",        &menu_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/left/input/grip/pose",         &left_grip_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/right/input/grip/pose",        &right_grip_path);
-        pfn_xrStringToPath(xr_instance, "/user/hand/right/input/trigger",          &right_trigger_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/right/input/squeeze",          &right_squeeze_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/right/input/a/click",          &a_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/left/input/thumbstick/click",  &left_stick_click_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/right/input/b/click",           &b_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/right/input/thumbstick/click", &right_stick_click_path);
-        pfn_xrStringToPath(xr_instance, "/user/hand/left/input/trigger",           &left_trigger_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/left/input/squeeze",           &left_squeeze_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/right/output/haptic",          &right_haptic_path);
         pfn_xrStringToPath(xr_instance, "/user/hand/left/output/haptic",           &left_haptic_path);
@@ -1238,17 +1256,49 @@ static bool init_xr_session(void)
 
         /* Create action spaces for grip poses (must be after xrAttachSessionActionSets) */
         if (pfn_xrCreateActionSpace) {
-            XrActionSpaceCreateInfo grip_space_info = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
-            grip_space_info.poseInActionSpace.orientation.w = 1.0f;
-            grip_space_info.subactionPath = XR_NULL_PATH;
+            if (vr_headset == QUEST) {
+                XrActionSpaceCreateInfo grip_space_info = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
+                grip_space_info.poseInActionSpace.orientation.w = 1.0f;
+                grip_space_info.subactionPath = XR_NULL_PATH;
 
-            grip_space_info.action = xr_left_grip_action;
-            result = pfn_xrCreateActionSpace(xr_session, &grip_space_info, &xr_left_grip_space);
-            if (XR_FAILED(result)) SDL_Log("XR: failed to create left grip space: %d", (int)result);
+                grip_space_info.action = xr_left_grip_action;
+                result = pfn_xrCreateActionSpace(xr_session, &grip_space_info, &xr_left_grip_space);
+                if (XR_FAILED(result)) SDL_Log("XR: failed to create left grip space: %d", (int)result);
 
-            grip_space_info.action = xr_right_grip_action;
-            result = pfn_xrCreateActionSpace(xr_session, &grip_space_info, &xr_right_grip_space);
-            if (XR_FAILED(result)) SDL_Log("XR: failed to create right grip space: %d", (int)result);
+                grip_space_info.action = xr_right_grip_action;
+                result = pfn_xrCreateActionSpace(xr_session, &grip_space_info, &xr_right_grip_space);
+                if (XR_FAILED(result)) SDL_Log("XR: failed to create right grip space: %d", (int)result);
+            } else if (vr_headset == PICO) {
+                XrActionSpaceCreateInfo grip_space_info = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
+                grip_space_info.subactionPath = XR_NULL_PATH;
+
+                grip_space_info.poseInActionSpace.orientation.x = 0.0f;
+                grip_space_info.poseInActionSpace.orientation.y = 0.0f;
+                grip_space_info.poseInActionSpace.orientation.z = 0.0f;
+                grip_space_info.poseInActionSpace.orientation.w = 1.0f;
+
+                grip_space_info.action = xr_left_grip_action;
+                result = pfn_xrCreateActionSpace(xr_session, &grip_space_info, &xr_left_grip_space);
+
+                if (XR_FAILED(result))
+                    SDL_Log("XR: failed to create left grip space: %d", (int)result);
+
+                const float weapon_pitch_deg = 20.0f;
+                const float weapon_pitch_rad = weapon_pitch_deg * (3.14159265358979323846f / 180.0f);
+
+                grip_space_info.poseInActionSpace.orientation.x = SDL_sinf(weapon_pitch_rad * 0.5f);
+
+                grip_space_info.poseInActionSpace.orientation.y = 0.0f;
+                grip_space_info.poseInActionSpace.orientation.z = 0.0f;
+
+                grip_space_info.poseInActionSpace.orientation.w = SDL_cosf(weapon_pitch_rad * 0.5f);
+
+                grip_space_info.action = xr_right_grip_action;
+                result = pfn_xrCreateActionSpace(xr_session, &grip_space_info, &xr_right_grip_space);
+
+                if (XR_FAILED(result))
+                    SDL_Log("XR: failed to create right grip space: %d", (int)result);
+            }
         }
     }
 
