@@ -60,6 +60,36 @@ if (AVP_MAC AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     message(STATUS "AVP: CMAKE_OSX_DEPLOYMENT_TARGET -> 11.3 (floor set by the bundled OpenAL)")
 endif()
 
+# ---------------------------------------------------------------------------
+# PCVR target — Windows and Linux (OPT-IN — disabled by default)
+#
+# Builds the OpenXR VR path (the same one the Quest uses) against desktop GL,
+# running on SteamVR or any desktop OpenXR runtime. The Khronos loader is
+# bundled per platform and loaded at RUNTIME (no import lib / no link), so a
+# machine with no headset or no OpenXR runtime still starts the exe and falls
+# back to the flat desktop render path:
+#
+#   Windows   extern/OpenXR/lib/windows/<arch>/openxr_loader.dll   (LoadLibraryA)
+#   Linux     extern/OpenXR/lib/linux/<arch>/libopenxr_loader.so   (dlopen)
+#
+# The two differ in how the GL context reaches xrCreateSession, which is the
+# only meaningful platform split in the VR code:
+#
+#   Windows   AVP_PCVR_WIN32 — XrGraphicsBindingOpenGLWin32KHR from WGL
+#   Linux     AVP_PCVR_XLIB  — XrGraphicsBindingOpenGLXlibKHR from GLX, built in
+#                              src/xr_linux_glx.c. X11 only: no runtime
+#                              implements the Wayland binding, so the game pins
+#                              SDL to its x11 driver (fine under XWayland).
+#
+# Both also define AVP_PCVR (desktop OpenXR) and AVP_XR (all VR code, Quest
+# included). The VR build is fully self-contained and lands in its OWN folder,
+# build/<os>/<arch>vr/, so it never shares config.cfg or user_profiles with the
+# flat build next door. Enable with a SEPARATE binary dir:
+#   cmake -DAVP_ENABLE_PCVR=ON ...        (e.g. platform/windows/x64vr)
+#   ./build-linux.sh --vr x64             (Linux; also needs AVP_ENABLE_LINUX)
+# ---------------------------------------------------------------------------
+option(AVP_ENABLE_PCVR "Build the OpenXR (SteamVR) PCVR target — Windows or Linux" OFF)
+
 if (ANDROID)
     PROJECT(avpvr)
 endif()
@@ -168,6 +198,11 @@ if (ANDROID)
     # Tell CMake where to find the SDL3 Android headers and binaries
     # Usually you'd use add_subdirectory(extern/SDL3) here
     add_definitions(-DANDROID)
+    # AVP_XR gates the shared OpenXR/VR code (present on Android AND the Windows
+    # PCVR build). On Android it is always defined, so every former
+    # `#ifdef __ANDROID__` XR guard preprocesses exactly as before; genuinely
+    # Android-only code (JNI, EGL, dlopen, gamepads) still uses __ANDROID__.
+    add_definitions(-DAVP_XR)
     # Non-VR "phone" build variant: the Gradle `phone` product flavor passes
     # -DAVP_DISABLE_XR=ON, which makes main.c skip OpenXR init entirely and use the
     # flat (windowed) render path + SDL_GL_SwapWindow. The Quest `quest` flavor leaves
@@ -294,6 +329,57 @@ if (WIN32)
                 "path. Rebuild the bundled libs to match the headers.")
         endif()
     endforeach()
+
+endif()
+
+# ---------------------------------------------------------------------------
+# PCVR (OpenXR) — shared by Windows and Linux; see the option block near the top.
+#
+# The shared VR code compiles in via AVP_XR, the desktop-OpenXR specifics via
+# AVP_PCVR, and the graphics-binding half via AVP_PCVR_WIN32 / AVP_PCVR_XLIB.
+# Only the Khronos loader is needed and it is opened at runtime, so there is
+# nothing to link here. Hard-fail when the loader for this arch is missing,
+# matching the bundled-lib checks above, since the post-build staging step would
+# otherwise fail mid-build instead.
+# ---------------------------------------------------------------------------
+if (AVP_ENABLE_PCVR)
+    if (NOT (WIN32 OR AVP_LINUX))
+        message(FATAL_ERROR
+            "AVP_ENABLE_PCVR is only supported on Windows and Linux. On Android the "
+            "VR path is always on; on macOS there is no OpenXR runtime.")
+    endif()
+
+    if (WIN32)
+        set(AVP_OPENXR_LOADER "${CMAKE_SOURCE_DIR}/extern/OpenXR/lib/windows/${ARCH_DIR}/openxr_loader.dll")
+        set(AVP_OPENXR_HINT   "openxr_loader.dll")
+    else()
+        set(AVP_OPENXR_LOADER "${CMAKE_SOURCE_DIR}/extern/OpenXR/lib/linux/${ARCH_DIR}/libopenxr_loader.so")
+        set(AVP_OPENXR_HINT   "libopenxr_loader.so")
+    endif()
+
+    if (NOT EXISTS "${AVP_OPENXR_LOADER}")
+        message(FATAL_ERROR
+            "PCVR build: missing ${AVP_OPENXR_LOADER}\n"
+            "Drop in the Khronos OpenXR loader for ${ARCH_DIR} (${AVP_OPENXR_HINT} — "
+            "a prebuilt one ships with the OpenXR-SDK Windows releases at "
+            "github.com/KhronosGroup/OpenXR-SDK; on Linux build that repo's "
+            "openxr_loader target, or copy your distro's), or configure with "
+            "-DAVP_ENABLE_PCVR=OFF.")
+    endif()
+
+    add_definitions(-DAVP_XR -DAVP_PCVR)
+
+    if (WIN32)
+        add_definitions(-DAVP_PCVR_WIN32)
+        message(STATUS "AVP: PCVR (OpenXR) build enabled -> avp_${ARCH_DIR}vr.exe")
+    else()
+        # The Linux binding is GLX, so this build needs Xlib on top of the GL that
+        # every target already links. REQUIRED: without it the only symptom would be
+        # a link error on glXGetCurrentDisplay several minutes into the build.
+        find_package(X11 REQUIRED)
+        add_definitions(-DAVP_PCVR_XLIB)
+        message(STATUS "AVP: PCVR (OpenXR) build enabled -> avp_${ARCH_DIR}vr")
+    endif()
 endif()
     MESSAGE(WARNING "SDL 3.0 support is STABLE.")
 
@@ -732,6 +818,13 @@ LIST(APPEND source src/menus.c)
 LIST(APPEND source src/main.c)
 #LIST(APPEND source src/avp/xr_camera.c)
 
+# Linux PCVR only: the Xlib/GLX graphics binding. Its own translation unit
+# because Xlib's Bool/Status/None/Window/Screen/Cursor collide with the game
+# headers main.c includes — see the comment at the top of the file.
+if (AVP_ENABLE_PCVR AND AVP_LINUX)
+    LIST(APPEND source src/xr_linux_glx.c)
+endif()
+
 ### build all source as C++
 ### (not normally used)
 ##SET_SOURCE_FILES_PROPERTIES(${source} PROPERTIES LANGUAGE CXX)
@@ -867,6 +960,15 @@ if (AVP_LINUX OR AVP_MAC)
         m
         pthread
     )
+
+    # Linux PCVR: xr_linux_glx.c needs Xlib on top of the GL above. The GLX half
+    # (glXGetCurrentDisplay, glXGetFBConfigs, ...) already comes in with
+    # AVP_GL_LINK — OpenGL::GL pulls libGLX on GLVND and plain libGL otherwise —
+    # so X11 is the only addition.
+    if (AVP_ENABLE_PCVR)
+        target_link_libraries(avp ${X11_LIBRARIES})
+        target_include_directories(avp PRIVATE ${X11_INCLUDE_DIR})
+    endif()
 endif ()
 
 #ANDROID LINK LIBRARIES
@@ -1020,22 +1122,38 @@ elseif (WIN32)
     
     install (TARGETS avp DESTINATION .)
 
+    # The PCVR build gets its own exe name AND its own output folder
+    # (build/windows/<arch>vr), fully self-contained: the post-build steps below
+    # all stage into $<TARGET_FILE_DIR:avp>, so the DLLs, loader and assets
+    # follow the folder automatically. Kept separate from the flat build so the
+    # two never fight over config.cfg / user_profiles (the game writes next to
+    # its assets — see "Where the game writes" in CLAUDE.md).
+    if (AVP_ENABLE_PCVR)
+        set(AVP_EXE_NAME "avp_${AVP_ARCH}vr")
+        set(AVP_OUT_DIR  "${AVP_ARCH}vr")
+    else()
+        set(AVP_EXE_NAME "avp_${AVP_ARCH}")
+        set(AVP_OUT_DIR  "${AVP_ARCH}")
+    endif()
+
     # Place the exe and all accompanying files inside a avp/ subfolder,
     # mirroring the avp.app bundle layout on macOS.
     set_target_properties(avp PROPERTIES
-        # Name the exe per-arch (avp_x64.exe / avp_x86.exe / avp_arm64.exe) so the
+        # Name the exe per-arch (avp_x64.exe / avp_x86.exe / avp_arm64.exe —
+        # avp_<arch>vr.exe for the PCVR build) so the
         # builds can coexist. Set here (not in the generated .vcxproj) so it
         # survives a CMake regenerate.
-        OUTPUT_NAME "avp_${AVP_ARCH}"
+        OUTPUT_NAME "${AVP_EXE_NAME}"
         # Anchored to the source tree rather than the build dir, so it lands in
-        # <repo>/build/windows/<arch> no matter where CMake was pointed. Resolves to
+        # <repo>/build/windows/<arch> (build/windows/<arch>vr for PCVR) no matter
+        # where CMake was pointed. Resolves to
         # the same place as before for the documented platform/windows/<arch> layout.
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../build/windows/${AVP_ARCH}"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../build/windows/${AVP_OUT_DIR}"
         # Launch the VS debugger (F5 / "Local Windows Debugger") with the CWD set
         # to the exe's own folder, so it finds the assets copied next to it —
         # matching how it behaves when run from Explorer. Without this the
         # debugger uses the project dir and the game can't locate its data.
-        VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../build/windows/${AVP_ARCH}"
+        VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../build/windows/${AVP_OUT_DIR}"
     )
 
     # Runtime DLLs live in the target sysroot bin, not the host compiler bin.
@@ -1049,6 +1167,17 @@ elseif (WIN32)
                 "$<TARGET_FILE_DIR:avp>"
         COMMENT "Copying SDL3 runtime DLL next to avp.exe"
         VERBATIM)
+
+    # 1a. PCVR: stage the OpenXR loader next to the exe. main.c LoadLibraryA's
+    # it at startup; without it the exe silently runs flat.
+    if (AVP_ENABLE_PCVR)
+        add_custom_command(TARGET avp POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${AVP_OPENXR_LOADER}"
+                    "$<TARGET_FILE_DIR:avp>"
+            COMMENT "Copying openxr_loader.dll next to ${AVP_EXE_NAME}.exe"
+            VERBATIM)
+    endif()
 
     # 1b. Copy the FFmpeg runtime DLLs. Glob them per-arch rather than naming them:
     # the versioned suffixes differ between the bundled builds (x64/x86 ship
@@ -1105,13 +1234,26 @@ elseif (AVP_LINUX)
     # Mirror the Windows layout: one folder per arch under build/linux, holding the
     # binary, its bundled .so's and the assets. Named per-arch (avp_x64 / avp_x86 /
     # avp_arm64) so the three builds can coexist.
+    #
+    # The PCVR build gets its own name AND its own folder (build/linux/<arch>vr),
+    # exactly as the Windows one does — kept apart from the flat build so the two
+    # never fight over config.cfg / user_profiles, which the game writes next to
+    # its assets (see "Where the game writes" in CLAUDE.md).
+    if (AVP_ENABLE_PCVR)
+        set(AVP_EXE_NAME "avp_${ARCH_DIR}vr")
+        set(AVP_OUT_DIR  "${ARCH_DIR}vr")
+    else()
+        set(AVP_EXE_NAME "avp_${ARCH_DIR}")
+        set(AVP_OUT_DIR  "${ARCH_DIR}")
+    endif()
+
     set_target_properties(avp PROPERTIES
-        OUTPUT_NAME "avp_${ARCH_DIR}"
+        OUTPUT_NAME "${AVP_EXE_NAME}"
         # Anchored to the source tree, NOT to the build dir: a Linux build tree can
         # live anywhere (/tmp/avp-x64, ~/build, ...), and the old
         # CMAKE_CURRENT_BINARY_DIR/../../../ form silently resolved to /build and
         # failed the link with "mkdir(/build): Permission denied".
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../build/linux/${ARCH_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../build/linux/${AVP_OUT_DIR}"
         # Any bundled extern/*/lib/linux/<arch>/*.so we linked is copied next to the
         # binary and found via an $ORIGIN rpath, so the game runs without those libs
         # being installed system-wide. BUILD_WITH_INSTALL_RPATH TRUE applies $ORIGIN to
@@ -1136,7 +1278,7 @@ elseif (AVP_LINUX)
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                     "${CMAKE_SOURCE_DIR}/../assets"
                     "$<TARGET_FILE_DIR:avp>"
-            COMMENT "Updating assets next to avp_${ARCH_DIR}"
+            COMMENT "Updating assets next to ${AVP_EXE_NAME}"
             VERBATIM)
     else()
         message(STATUS "AVP: no assets/ folder found — skipping the asset copy step.")
@@ -1194,6 +1336,12 @@ elseif (AVP_LINUX)
             avp_stage_linux_lib("${avp_lib}")
         endforeach()
     endif()
+    # The OpenXR loader is never linked — main.c dlopens it by SONAME — but it is
+    # staged the same way as everything else, which is what puts the
+    # libopenxr_loader.so.1 that dlopen asks for next to the binary.
+    if (AVP_ENABLE_PCVR)
+        avp_stage_linux_lib("${AVP_OPENXR_LOADER}")
+    endif()
 
     # Same stale-file problem as Windows, made worse by SONAMEs: an FFmpeg major bump
     # leaves libavcodec.so.63 sitting next to the new libavcodec.so.62, and unlike a
@@ -1205,10 +1353,10 @@ elseif (AVP_LINUX)
         add_custom_command(TARGET avp POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                     "-DPRUNE_DIR=$<TARGET_FILE_DIR:avp>"
-                    "-DPRUNE_GLOBS=libavcodec.so*|libavformat.so*|libavutil.so*|libswscale.so*|libswresample.so*|libavfilter.so*|libavdevice.so*|libSDL3.so*|libopenal.so*"
+                    "-DPRUNE_GLOBS=libavcodec.so*|libavformat.so*|libavutil.so*|libswscale.so*|libswresample.so*|libavfilter.so*|libavdevice.so*|libSDL3.so*|libopenal.so*|libopenxr_loader.so*"
                     "-DPRUNE_KEEP=${AVP_STAGED_NAMES_ARG}"
                     -P "${CMAKE_SOURCE_DIR}/cmake/prune-stale-libs.cmake"
-            COMMENT "Pruning stale bundled .so's next to avp_${ARCH_DIR}"
+            COMMENT "Pruning stale bundled .so's next to ${AVP_EXE_NAME}"
             VERBATIM)
     endif()
 else ()

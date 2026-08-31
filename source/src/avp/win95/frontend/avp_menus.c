@@ -95,8 +95,8 @@ int CloudTable[128][128];
 extern char MP_Config_Name[];
 extern int ShowFrameRate;
 extern int VRRefreshRateIndex;
+extern int VRRefreshRateHz;
 extern int MSAASampleIndex;
-extern int FSRQualityIndex;
 extern int VRTurnMode;
 extern int VRSnapAngleIndex;
 extern int VRSmoothTurnSpeed;
@@ -144,8 +144,9 @@ static void KeyboardEntryQueue_StartProcessing(void);
 /* Show/hide the system on-screen keyboard for menu text entry (defined in main.c). */
 extern void Platform_SetTextInputActive(int active);
 
-#ifdef __ANDROID__
-/* VR controller-driven on-screen keyboard (defined further down). */
+#ifdef AVP_MENU_VR
+/* VR controller-driven on-screen keyboard (defined further down). Headset only —
+   the phone flavor types on the Android system keyboard instead. */
 static void OnScreenKeyboard_HandleInput(void);
 static void OnScreenKeyboard_Render(void);
 #endif
@@ -338,8 +339,8 @@ int AvP_MainMenus(void)
 		{
 			int savedShowFrameRate = ShowFrameRate;
 			int savedVRRefreshRateIndex = VRRefreshRateIndex;
+			int savedVRRefreshRateHz = VRRefreshRateHz;   /* the rate is the stored value; the index is derived */
 			int savedMSAASampleIndex = MSAASampleIndex;
-			int savedFSRQualityIndex = FSRQualityIndex;
 			int savedVRTurnMode = VRTurnMode;
 			int savedVRSnapAngleIndex = VRSnapAngleIndex;
 			int savedVRSmoothTurnSpeed = VRSmoothTurnSpeed;
@@ -355,8 +356,8 @@ int AvP_MainMenus(void)
 					GetSettingsFromUserProfile();
 					savedShowFrameRate = ShowFrameRate;
 					savedVRRefreshRateIndex = VRRefreshRateIndex;
+					savedVRRefreshRateHz = VRRefreshRateHz;
 					savedMSAASampleIndex = MSAASampleIndex;
-					savedFSRQualityIndex = FSRQualityIndex;
 					savedVRTurnMode = VRTurnMode;
 					savedVRSnapAngleIndex = VRSnapAngleIndex;
 					savedVRSmoothTurnSpeed = VRSmoothTurnSpeed;
@@ -377,8 +378,8 @@ int AvP_MainMenus(void)
 
 			ShowFrameRate = savedShowFrameRate;
 			VRRefreshRateIndex = savedVRRefreshRateIndex;
+			VRRefreshRateHz = savedVRRefreshRateHz;
 			MSAASampleIndex = savedMSAASampleIndex;
-			FSRQualityIndex = savedFSRQualityIndex;
 			VRTurnMode = savedVRTurnMode;
 			VRSnapAngleIndex = savedVRSnapAngleIndex;
 			VRSmoothTurnSpeed = savedVRSmoothTurnSpeed;
@@ -547,6 +548,7 @@ extern void QuickSplashScreens(void)
 
 extern void AvP_TriggerInGameMenus(void)
 {
+	SDL_Log("MENU: in-game (pause) menu opened");
 	AvPMenus.MenusState = MENUSSTATE_INGAMEMENUS;
 	SetupNewMenu(AVPMENU_INGAME);
 
@@ -855,7 +857,7 @@ extern void AvP_UpdateMenus(void)
 			break;
 		}
 	}
-#ifdef __ANDROID__
+#ifdef AVP_MENU_VR
 	/* Draw the VR on-screen keyboard over the menu while a field is being edited. */
 	if (AvPMenus.UserEnteringText || AvPMenus.UserEnteringNumber)
 		OnScreenKeyboard_Render();
@@ -2045,10 +2047,11 @@ static void RenderHelpString()
 	AVPMENU_ELEMENT *elementPtr = &AvPMenus.MenuElements[AvPMenus.CurrentlySelectedElement];
 	enum TEXTSTRING_ID helpString = elementPtr->HelpString;
 
-#ifdef __ANDROID__
+#ifdef AVP_MENU_VR
 	/* VR: the profile-select help depends on which slot is highlighted —
 	 * the blank "New Profile" slot (UserProfileNumber 0) needs the name+continue
-	 * instructions; an existing profile just needs the continue prompt. */
+	 * instructions; an existing profile just needs the continue prompt. Both name
+	 * controller buttons ("Press A to select... B to delete"), so headset only. */
 	if (elementPtr->ElementID == AVPMENU_ELEMENT_USERPROFILE)
 	{
 		helpString = (UserProfileNumber == 0)
@@ -2122,8 +2125,10 @@ static void GenerateRandomName(char* dest, size_t maxLength)
 	dest[maxLength - 1] = '\0';
 }
 
-#ifdef __ANDROID__
+#ifdef AVP_MENU_VR
 /* ================= VR on-screen keyboard ==================================
+ * Headset builds only (AVP_MENU_VR, not AVP_XR): the non-VR phone flavor has no
+ * controller to drive this and raises the Android system keyboard instead.
  * In VR there is no physical keyboard, so menu text / number fields (profile
  * name, multiplayer IP + details) are typed with the controller: the thumbstick
  * moves the highlight and A presses the highlighted key. Pressed characters are
@@ -2281,7 +2286,7 @@ static void OnScreenKeyboard_Render(void)
 		startY + (OSK_NUM_CHAR_ROWS + 1) * rowH + 4, ONE_FIXED,
 		AVPMENUFORMAT_CENTREJUSTIFIED, ONE_FIXED, ONE_FIXED, ONE_FIXED);
 }
-#endif /* __ANDROID__ */
+#endif /* AVP_MENU_VR */
 
 static void ActUponUsersInput(void)
 {
@@ -2296,16 +2301,22 @@ static void ActUponUsersInput(void)
 		BackspaceTimer=0;
 	}
 
-#ifdef __ANDROID__
-	/* Quest/Android: raise the system on-screen keyboard while a menu text or
+#ifdef AVP_XR
+	/* Quest/Android/PCVR: raise the SYSTEM on-screen keyboard while a menu text or
 	   number field is being edited (name entry, multiplayer IP/details, etc.),
 	   and dismiss it otherwise. There is no physical keyboard on the headset, so
 	   without this there is no way to trigger it. Idempotent, so it only acts on
 	   transitions; typed characters arrive as SDL_EVENT_TEXT_INPUT and feed
-	   KeyboardEntryQueue_Add() (see main.c). */
+	   KeyboardEntryQueue_Add() (see main.c).
+
+	   Stays on AVP_XR deliberately: the non-VR phone flavor needs this just as
+	   much as a headset does — it is the only way to type on a phone. */
 	Platform_SetTextInputActive(AvPMenus.UserEnteringText || AvPMenus.UserEnteringNumber);
+#endif
+#ifdef AVP_MENU_VR
 	/* Controller-driven on-screen keyboard: turns stick/A into characters and
-	   backspace/confirm before the field handler below runs. */
+	   backspace/confirm before the field handler below runs. Headset only — on a
+	   phone there is no controller, and the system keyboard above covers it. */
 	if (AvPMenus.UserEnteringText || AvPMenus.UserEnteringNumber)
 		OnScreenKeyboard_HandleInput();
 #endif
@@ -2964,6 +2975,7 @@ static void InteractWithMenuElement(enum AVPMENU_ELEMENT_INTERACTION_ID interact
 			{
 				if(AvPMenus.MenusState == MENUSSTATE_INGAMEMENUS)
 				{
+					SDL_Log("EXIT: menu QUITGAME selected in-game - leaving the level");
 					AvP.MainLoopRunning = 0;
 				}
 				AvPMenus.MenusState = MENUSSTATE_OUTSIDEMENUS;
@@ -3375,7 +3387,11 @@ static void InteractWithMenuElement(enum AVPMENU_ELEMENT_INTERACTION_ID interact
 		{
 			if (interactionID == AVPMENU_ELEMENT_INTERACTION_SELECT)
 			{
+				extern void ApplySelectedVideoMode(void);
 				SaveDeviceAndVideoModePreferences();
+				/* Apply straight away rather than next launch. The resulting
+				   resize is handled by the SDL_EVENT_WINDOW_RESIZED path. */
+				ApplySelectedVideoMode();
 				SetupNewMenu(elementPtr->b.MenuToGoTo);
 			}
 			break;
@@ -3392,6 +3408,7 @@ static void InteractWithMenuElement(enum AVPMENU_ELEMENT_INTERACTION_ID interact
 		{
 			if (interactionID == AVPMENU_ELEMENT_INTERACTION_SELECT)
 			{
+				SDL_Log("MENU: RESTART MISSION selected");
 				AvP.RestartLevel=1;
 				AvPMenus.MenusState = MENUSSTATE_STARTGAME;
 			}
@@ -5785,13 +5802,16 @@ void HandleCheatModeFeatures(void)
 
 void ShowMenuFrameRate(void)
 {
-	extern int NormalFrameTime;
+	extern int GetSmoothedFrameRate(void);
 	extern float VR_GetTargetHz(void);
+	extern float Platform_GetDisplayRefreshHz(void);
 	extern int ShowFrameRate;
 	if (!ShowFrameRate) return;
 	char buffer[24];
-	int fps = NormalFrameTime > 0 ? 65536 / NormalFrameTime : 0;
+	int fps = GetSmoothedFrameRate();
+	/* Headset rate when a session is presenting, otherwise the monitor's. */
 	float target_hz = VR_GetTargetHz();
+	if (target_hz <= 0.0f) target_hz = Platform_GetDisplayRefreshHz();
 	if (target_hz > 0.0f)
 		SDL_snprintf(buffer, sizeof(buffer), "%d fps/%.0f Hz", fps, target_hz);
 	else

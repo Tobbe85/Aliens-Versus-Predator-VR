@@ -4359,20 +4359,29 @@ extern void TranslationSetup(void)
 	#endif
 
 	#if 1
-#ifdef __ANDROID__
+#ifdef AVP_XR
 	extern int vr_is_rendering;
 	float vr_y_scale = vr_is_rendering ? (1.0f / 65536.0f) : (4.0f / (65536.0f * 3.0f));
 #else
-	/* Aspect correction = render width/height. A hardcoded 4:3 stretched the 3D view
-	   horizontally on wider (16:9) windows; use the actual viewport aspect so the
-	   image isn't distorted. Widescreen then widens the horizontal FOV (Hor+). */
-	float desktop_aspect = 4.0f / 3.0f;
-	{
-		int _w = Global_VDB_Ptr->VDB_ClipRight - Global_VDB_Ptr->VDB_ClipLeft;
-		int _h = Global_VDB_Ptr->VDB_ClipDown  - Global_VDB_Ptr->VDB_ClipUp;
-		if (_w > 0 && _h > 0) desktop_aspect = (float)_w / (float)_h;
-	}
-	float vr_y_scale = desktop_aspect / 65536.0f;
+	/* Y scale = ProjX / ProjY.
+
+	   That ratio is the general condition for an UNDISTORTED image, whatever FOV
+	   the current lens asks for. Working it through: horizontal half-FOV is
+	   atan(CentreX/ProjX) and vertical is atan(CentreY/(ProjY*k)), so squares stay
+	   square when tan(H)/tan(V) equals the viewport aspect, which reduces to
+	   k = ProjX/ProjY. It reproduces the 1999 original's hardcoded 4/3 exactly at
+	   4:3 (ProjX=w/2, ProjY=h/2 -> w/h), and it automatically gives the right
+	   answer for both lenses now that they scale differently on widescreen: the
+	   normal lens is Hor+ (height-derived ProjX, k stays 4/3) while the Alien's
+	   wide lens stays width-derived and goes Vert- (k becomes the live aspect),
+	   because it is already at the widest hardcoded clip frustum — see the long
+	   note on AVP_PROJX_NORMAL/WIDE in prototyp.h.
+
+	   The port previously hardcoded the live viewport aspect here, which forced
+	   BOTH lenses to Vert- and made the view read as zoomed in on 16:9. */
+	float vr_y_scale = (Global_VDB_Ptr->VDB_ProjY != 0)
+	                 ? ((float)Global_VDB_Ptr->VDB_ProjX / (float)Global_VDB_Ptr->VDB_ProjY) / 65536.0f
+	                 : (4.0f / (65536.0f * 3.0f));
 #endif
 	ViewMatrix[0+1*4] = (float)(Global_VDB_Ptr->VDB_Mat.mat12) * vr_y_scale * p;
 	ViewMatrix[1+1*4] = (float)(Global_VDB_Ptr->VDB_Mat.mat22) * vr_y_scale * p;
@@ -4389,10 +4398,14 @@ extern void TranslationSetup(void)
 	RotateVector(&v,&Global_VDB_Ptr->VDB_Mat);
 
 	ViewMatrix[3+0*4] = ((float)-v.vx)*o;
-	#ifdef __ANDROID__
+	#ifdef AVP_XR
 		ViewMatrix[3+1*4] = ((float)-v.vy) * (vr_is_rendering ? 1.0f : (4.0f/3.0f)) * p;
 	#else
-		ViewMatrix[3 + 1 * 4] = ((float)-v.vy) * desktop_aspect * p;
+		/* Same ProjX/ProjY ratio as the Y rows above (this row is the translation,
+		   so it takes the un-divided form). The AVP_XR branch above still uses a
+		   flat 4/3 for its non-VR case, which the old live-aspect code silently
+		   disagreed with; both now land on 4/3 for the normal lens at any aspect. */
+		ViewMatrix[3 + 1 * 4] = ((float)-v.vy) * (vr_y_scale * 65536.0f) * p;
 	#endif
 	ViewMatrix[3+2*4] = ((float)-v.vz)*CameraZoomScale;
 
@@ -6184,7 +6197,7 @@ void RenderPredatorTargetingSegment(int theta, int scale, int drawInRed)
 	VECTOR2D offset[4];
  	POLYHEADER fakeHeader;
 	int centreX,centreY;
-	#ifdef __ANDROID__
+	#ifdef AVP_XR
 	VECTORCH vrTargetDir; int vrHaveTarget = 0; /* VR: target's view-space direction, applied after zoom */
 	#endif
 	int z = ONE_FIXED-scale;
@@ -6194,7 +6207,7 @@ void RenderPredatorTargetingSegment(int theta, int scale, int drawInRed)
 		extern SCREENDESCRIPTORBLOCK ScreenDescriptorBlock;
 		int useScreenSight = 1;
 
-		#ifdef __ANDROID__
+		#ifdef AVP_XR
 		/* In VR, place the reticle by transforming the locked target's WORLD position
 		 * into THIS eye with the current VDB - the exact transform the renderer uses -
 		 * rather than the precomputed/eye-0 SmartTargetSightX/Y (which carries a 4:3
@@ -6241,7 +6254,7 @@ void RenderPredatorTargetingSegment(int theta, int scale, int drawInRed)
 	}
 	z = (float)z*CameraZoomScale;
 
-	#ifdef __ANDROID__
+	#ifdef AVP_XR
 	/* Map the target's view-space direction onto the (zoom-scaled) reticle depth z so
 	 * the reticle centre projects to the same eye pixel as the enemy.
 	 *
@@ -6302,7 +6315,7 @@ void RenderPredatorTargetingSegment(int theta, int scale, int drawInRed)
 			offset[2].vx = -offset[2].vx;
 			offset[3].vx = -offset[3].vx;
 		}
-		#ifdef __ANDROID__
+		#ifdef AVP_XR
 		/* The reticle reads large in the headset (VDB_ProjX is eye-FBO sized while the
 		 * HUD SDB centre is 320), so shrink the lock-on triangle arms in VR. */
 		if (vrHaveTarget)

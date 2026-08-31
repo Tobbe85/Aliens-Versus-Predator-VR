@@ -36,8 +36,12 @@ extern int AutoWeaponChangeOn;
 extern int ShowCrosshair;
 extern int ShowFrameRate;
 extern int VRRefreshRateIndex;
+extern int VRRefreshRateHz;
+extern int VR_GetRefreshRateIndexForHz(float hz);
 extern int MSAASampleIndex;
-extern int FSRQualityIndex;
+extern int AnisotropicFilterIndex;
+extern int TextureFilterIndex;
+extern int NPOTMipmapsEnabled;
 extern int VRTurnMode;
 extern int VRSnapAngleIndex;
 extern int VRSmoothTurnSpeed;
@@ -268,8 +272,8 @@ static void SetDefaultProfileOptions(AVP_USER_PROFILE *profilePtr)
 	ShowCrosshair = 1;
 	ShowFrameRate = 0;
 	VRRefreshRateIndex = 0;
+	VRRefreshRateHz = 0;    /* unset; resolved against the headset's list at session start */
 	MSAASampleIndex = 1; /* 2x by default */
-	FSRQualityIndex = 0; /* desktop FSR off by default */
 	VRTurnMode = 0; /* snap turn by default */
 	VRSnapAngleIndex = 1; /* 45 degrees by default */
 	VRSmoothTurnSpeed = 5; /* mid speed by default (0..10) */
@@ -283,6 +287,10 @@ static void SetDefaultProfileOptions(AVP_USER_PROFILE *profilePtr)
 	EnemySpeedPredator = 10;
 	HUDInsetLevel = 0;       /* "Adjust HUD elements" defaults to level 1 (current layout) */
 	ManualReloadEnabled = 0; /* "Manual Reload" defaults to Off */
+	/* All three reproduce the filtering the port had before these were options. */
+	AnisotropicFilterIndex = 0; /* 16x, matching the old always-maximum behaviour */
+	TextureFilterIndex = 0;     /* trilinear, the old hardcoded min filter */
+	NPOTMipmapsEnabled = 0;     /* NPOT textures were never mipped before */
 
 	strcpy(MP_PlayerName, "Player");
 
@@ -322,9 +330,19 @@ extern void GetSettingsFromUserProfile(void)
 	AutoWeaponChangeOn = 			!UserProfilePtr->AutoWeaponChangeDisabled;
 	ShowCrosshair =				!UserProfilePtr->ShowCrosshairDisabled;
 	ShowFrameRate =				!UserProfilePtr->ShowFrameRateDisabled;
-	VRRefreshRateIndex =			UserProfilePtr->VRRefreshRateIndex;
+	/* The RATE is the stored value; the slider index is derived from it against
+	   whatever list this headset reports. Do NOT round-trip the index through
+	   the legacy VRRefreshRateIndex field: it is a 2-bit bitfield, so any index
+	   above 3 wraps to 0 on save and the setting silently reverts to the lowest
+	   rate (120 Hz is index 4 on a Quest 2, which reports 60/72/80/90/120).
+	   VR_GetRefreshRateIndexForHz returns 0 before enumeration has run, and the
+	   session-ready path recomputes it once the list is known. */
+	VRRefreshRateHz =			UserProfilePtr->VRRefreshRateHz;
+	VRRefreshRateIndex =			VR_GetRefreshRateIndexForHz((float)VRRefreshRateHz);
 	MSAASampleIndex =			UserProfilePtr->MSAASampleIndex;
-	FSRQualityIndex =			UserProfilePtr->FSRQualityIndex;
+	AnisotropicFilterIndex =		UserProfilePtr->AnisotropicFilterIndex;
+	TextureFilterIndex =			UserProfilePtr->TextureFilterIndex;
+	NPOTMipmapsEnabled =			UserProfilePtr->NPOTMipmapsEnabled;
 	VRTurnMode =				UserProfilePtr->VRTurnMode;
 	VRSnapAngleIndex =			UserProfilePtr->VRSnapAngleIndex;
 	VRSmoothTurnSpeed =			UserProfilePtr->VRSmoothTurnSpeed;
@@ -365,9 +383,14 @@ extern void SaveSettingsToUserProfile(AVP_USER_PROFILE *profilePtr)
 	profilePtr->AutoWeaponChangeDisabled =	!AutoWeaponChangeOn;
 	profilePtr->ShowCrosshairDisabled =	!ShowCrosshair;
 	profilePtr->ShowFrameRateDisabled =	!ShowFrameRate;
-	profilePtr->VRRefreshRateIndex =	VRRefreshRateIndex;
+	/* Only the rate is stored. The legacy 2-bit index field is left at 0 — see
+	   the note in GetSettingsFromUserProfile. */
+	profilePtr->VRRefreshRateIndex =	0;
+	profilePtr->VRRefreshRateHz =	(unsigned char)(VRRefreshRateHz > 255 ? 255 : VRRefreshRateHz);
 	profilePtr->MSAASampleIndex =		MSAASampleIndex;
-	profilePtr->FSRQualityIndex =		FSRQualityIndex;
+	profilePtr->AnisotropicFilterIndex =	AnisotropicFilterIndex;
+	profilePtr->TextureFilterIndex =	TextureFilterIndex;
+	profilePtr->NPOTMipmapsEnabled =	NPOTMipmapsEnabled;
 	profilePtr->VRTurnMode =		VRTurnMode;
 	profilePtr->VRSnapAngleIndex =		VRSnapAngleIndex;
 	profilePtr->VRSmoothTurnSpeed =		VRSmoothTurnSpeed;

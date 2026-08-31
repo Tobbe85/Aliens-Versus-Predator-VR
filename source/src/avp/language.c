@@ -122,7 +122,7 @@ char *GetTextString(enum TEXTSTRING_ID stringID)
 			case TEXTSTRING_AVOPTIONS_CROSSHAIR: return "Show Crosshair";
 			case TEXTSTRING_AVOPTIONS_CROSSHAIR_HELP: return "Crosshair helps with aiming.";
 			case TEXTSTRING_AVOPTIONS_FRAMERATE: return "Show FPS";
-			case TEXTSTRING_AVOPTIONS_FRAMERATE_HELP: return "Displays an FPS counter at top left.";
+			case TEXTSTRING_AVOPTIONS_FRAMERATE_HELP: return "Displays an FPS (Frames Per Second) counter at top left as screens Hz / gameplay fps.";
 			case TEXTSTRING_AVOPTIONS_VR_REFRESH_RATE: return "Refresh Rate";
 			case TEXTSTRING_AVOPTIONS_VR_REFRESH_RATE_HELP: return "Sets the refresh rate of the headset.";
 			case TEXTSTRING_VR_REFRESH_72:  return "72 Hz (Default)";
@@ -136,6 +136,22 @@ char *GetTextString(enum TEXTSTRING_ID stringID)
 			case TEXTSTRING_AVOPTIONS_MSAA_OFF: return "Off";
 			case TEXTSTRING_AVOPTIONS_MSAA_2X:  return "2x (Default)";
 			case TEXTSTRING_AVOPTIONS_MSAA_4X:  return "4x";
+			case TEXTSTRING_AVOPTIONS_ANISO:      return "Anisotropic Filtering";
+			case TEXTSTRING_AVOPTIONS_ANISO_HELP: return "Sharpens textures viewed at a steep angle, such as floors and walls ahead of you.";
+			case TEXTSTRING_AVOPTIONS_ANISO_16X:  return "16x (Default)";
+			case TEXTSTRING_AVOPTIONS_ANISO_8X:   return "8x";
+			case TEXTSTRING_AVOPTIONS_ANISO_4X:   return "4x";
+			case TEXTSTRING_AVOPTIONS_ANISO_2X:   return "2x";
+			case TEXTSTRING_AVOPTIONS_ANISO_OFF:  return "Off";
+			case TEXTSTRING_AVOPTIONS_TEXFILTER:           return "Texture Filtering";
+			case TEXTSTRING_AVOPTIONS_TEXFILTER_HELP:      return "Trilinear blends between mip levels. Nearest gives the unfiltered, pixelated original look.";
+			case TEXTSTRING_AVOPTIONS_TEXFILTER_TRILINEAR: return "Trilinear (Default)";
+			case TEXTSTRING_AVOPTIONS_TEXFILTER_BILINEAR:  return "Bilinear";
+			case TEXTSTRING_AVOPTIONS_TEXFILTER_NEAREST:   return "Nearest";
+			case TEXTSTRING_AVOPTIONS_NPOTMIPS:      return "NPOT Texture Mipmaps";
+			case TEXTSTRING_AVOPTIONS_NPOTMIPS_HELP: return "Mipmaps textures that had to be padded to a power of two, reducing shimmer in the distance.";
+			case TEXTSTRING_AVOPTIONS_NPOTMIPS_OFF:  return "Off (Default)";
+			case TEXTSTRING_AVOPTIONS_NPOTMIPS_ON:   return "On";
 			case TEXTSTRING_AVOPTIONS_FSR:              return "FSR Upscaling";
 			case TEXTSTRING_AVOPTIONS_FSR_OFF:          return "Off";
 			case TEXTSTRING_AVOPTIONS_FSR_ULTRAQUALITY: return "Ultra Quality";
@@ -197,7 +213,7 @@ char *GetTextString(enum TEXTSTRING_ID stringID)
 	}
 
 	if (stringID == TEXTSTRING_MAINMENU_SUBTITLE)
-#ifdef __ANDROID__
+#ifdef AVP_XR
 		return "VR Edition";
 #else
 		return "Classic 2000";

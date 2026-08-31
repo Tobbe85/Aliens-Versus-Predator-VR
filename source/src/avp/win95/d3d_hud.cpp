@@ -154,14 +154,33 @@ void Draw_HUDImage(HUDImageDesc *imageDescPtr)
 		scaledHeight = MUL_FIXED(imageDescPtr->Scale,imageDescPtr->Height);
 	}
 
-	quadVertices[0].U = imageDescPtr->TopLeftU;
-	quadVertices[0].V = imageDescPtr->TopLeftV;
-	quadVertices[1].U = imageDescPtr->TopLeftU + imageDescPtr->Width;
-	quadVertices[1].V = imageDescPtr->TopLeftV;
-	quadVertices[2].U = imageDescPtr->TopLeftU + imageDescPtr->Width;
-	quadVertices[2].V = imageDescPtr->TopLeftV + imageDescPtr->Height;
-	quadVertices[3].U = imageDescPtr->TopLeftU;
-	quadVertices[3].V = imageDescPtr->TopLeftV + imageDescPtr->Height;
+	/* Rescale the UVs — and ONLY the UVs — when an HD texture pack has replaced
+	   this atlas with a bigger one. TopLeftU/V and Width/Height are absolute
+	   pixels in the stock atlas, but Width/Height ALSO drive the on-screen quad
+	   above, so scaling the fields themselves would blow up the HUD's size. */
+	int uvU0 = imageDescPtr->TopLeftU;
+	int uvV0 = imageDescPtr->TopLeftV;
+	int uvU1 = imageDescPtr->TopLeftU + imageDescPtr->Width;
+	int uvV1 = imageDescPtr->TopLeftV + imageDescPtr->Height;
+	{
+		int uvScale = HUD_AtlasUVScale(imageDescPtr->ImageNumber);
+		if (uvScale != ONE_FIXED)
+		{
+			uvU0 = MUL_FIXED(uvU0, uvScale);
+			uvV0 = MUL_FIXED(uvV0, uvScale);
+			uvU1 = MUL_FIXED(uvU1, uvScale);
+			uvV1 = MUL_FIXED(uvV1, uvScale);
+		}
+	}
+
+	quadVertices[0].U = uvU0;
+	quadVertices[0].V = uvV0;
+	quadVertices[1].U = uvU1;
+	quadVertices[1].V = uvV0;
+	quadVertices[2].U = uvU1;
+	quadVertices[2].V = uvV1;
+	quadVertices[3].U = uvU0;
+	quadVertices[3].V = uvV1;
 	
 	quadVertices[0].X = imageDescPtr->TopLeftX;
 	quadVertices[0].Y = imageDescPtr->TopLeftY;
@@ -201,8 +220,22 @@ void D3D_InitialiseMarineHUD(void)
 	{
 		HUDResolution = HUD_RES_MED;
 		HUDImageNumber = CL_LoadImageOnce("Huds\\Marine\\MarineHUD.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE);
+		HUD_SetAtlasStockSize(HUDImageNumber, 256); /* authored size; see hud_layout.h */
 		MotionTrackerHalfWidth = 127/2;
 		MotionTrackerTextureSize = 128;
+
+		/* Every UV into this atlas is an ABSOLUTE PIXEL COORDINATE assuming the
+		   stock 256x256 MarineHUD.RIM: the tracker spans 1..129, the blue bar
+		   starts at V=223, the gunsight/crosshair sits at U=227. An HD texture
+		   pack that enlarges the atlas therefore leaves all of them describing a
+		   sub-rectangle, and the art renders magnified — HD Redux ships a
+		   1024x1024 replacement, so everything drawn from it came out 4x too big
+		   (the motion tracker and crosshair most visibly). Draw_HUDImage rescales
+		   the UVs it emits; the tracker below builds its own, so scale the size it
+		   uses for them here. MotionTrackerHalfWidth is deliberately NOT scaled —
+		   that one drives the on-screen geometry, not the texture lookup. */
+		MotionTrackerTextureSize = MUL_FIXED(MotionTrackerTextureSize,
+		                                     HUD_AtlasUVScale(HUDImageNumber));
 
 		BlueBar.ImageNumber = HUDImageNumber;
 		BlueBar.TopLeftX = 0;
@@ -222,6 +255,7 @@ void D3D_InitialiseMarineHUD(void)
 
 		/* load in sfx */
 		SpecialFXImageNumber = CL_LoadImageOnce("Common\\partclfx.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE);
+		HUD_SetAtlasStockSize(SpecialFXImageNumber, 256); /* authored size; see hud_layout.h */
 
 //		SpecialFXImageNumber = CL_LoadImageOnceEx("flame1",IRF_D3D,DDSCAPS_SYSTEMMEMORY,0);;
 //		SpecialFXImageNumber = CL_LoadImageOnceEx("star",IRF_D3D,DDSCAPS_SYSTEMMEMORY,0);;
@@ -234,7 +268,24 @@ void D3D_InitialiseMarineHUD(void)
 	MotionTrackerCentreX = BlueBar.TopLeftX+(BlueBar.Width/2);
 	MotionTrackerScale = 65536;
 
-	HUDScaleFactor = DIV_FIXED(ScreenDescriptorBlock.SDB_Width,640);	
+	/* Scale the HUD off HEIGHT, not width, and against 540 rather than 480.
+	   MEASURED, not derived. The 1999 source (and this file, until 2026-08-27)
+	   used SDB_Width/640, which is the same number at every 4:3 mode but
+	   over-scales on a wide display — it judges the HUD against width when the eye
+	   judges it against height. Switching the axis gave height/480 = 2.25 at
+	   1920x1080, still visibly bigger than the retail Classic 2000 build.
+	   Measuring both at 1920x1080 settled it: the HUD digits (22px tall before
+	   scaling) render 45px in this port against 40px in retail, and the green
+	   Health/Armor digits give the same 1.125 ratio, so retail is running an
+	   effective factor of exactly 2.0. 540 = 480 * 1.125 reproduces that.
+	   The retail binary is NOT this source — the re-release added widescreen
+	   support and evidently changed HUD scaling with it — so its actual formula is
+	   unknown and 2.0 at 1080p is the only data point. This stays proportional to
+	   height, so other resolutions are an extrapolation: 2.67 at 1440p, 4.0 at
+	   2160p. If retail turns out to clamp instead of scale, this needs revisiting.
+	   Note this is deliberately no longer bit-identical to 1999 on 4:3 modes
+	   (1024x768 gives 1.42 where the original gave 1.60). */
+	HUDScaleFactor = DIV_FIXED(ScreenDescriptorBlock.SDB_Height,540);
 
 	#if UseGadgets
 //	MotionTrackerGadget::SetCentre(r2pos(100,100));
@@ -251,17 +302,21 @@ void LoadCommonTextures(void)
 			case I_Predator:
 			{
 				PredatorNumbersImageNumber = CL_LoadImageOnce("HUDs\\Predator\\predNumbers.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE);
+				HUD_SetAtlasStockSize(PredatorNumbersImageNumber, 256); /* authored size; see hud_layout.h */
 				StaticImageNumber = CL_LoadImageOnce("Common\\static.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE|LIO_TRANSPARENT);
+				HUD_SetAtlasStockSize(StaticImageNumber, 128); /* authored size; see hud_layout.h */
 				break;
 			}
 			case I_Alien:
 			{
 				AlienTongueImageNumber = CL_LoadImageOnce("HUDs\\Alien\\AlienTongue.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE);
+				HUD_SetAtlasStockSize(AlienTongueImageNumber, 128); /* authored size; see hud_layout.h */
 				break;
 			}
 			case I_Marine:
 			{
 				StaticImageNumber = CL_LoadImageOnce("Common\\static.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE|LIO_TRANSPARENT);
+				HUD_SetAtlasStockSize(StaticImageNumber, 128); /* authored size; see hud_layout.h */
 //			   	ChromeImageNumber = CL_LoadImageOnce("Common\\water2.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE|LIO_TRANSPARENT);
 				break;
 			}
@@ -272,15 +327,22 @@ void LoadCommonTextures(void)
 	else
 	{
    		PredatorNumbersImageNumber = CL_LoadImageOnce("HUDs\\Predator\\predNumbers.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE);
+   		HUD_SetAtlasStockSize(PredatorNumbersImageNumber, 256); /* authored size; see hud_layout.h */
    		StaticImageNumber = CL_LoadImageOnce("Common\\static.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE|LIO_TRANSPARENT);
+   		HUD_SetAtlasStockSize(StaticImageNumber, 128); /* authored size; see hud_layout.h */
 		AlienTongueImageNumber = CL_LoadImageOnce("HUDs\\Alien\\AlienTongue.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE);
+		HUD_SetAtlasStockSize(AlienTongueImageNumber, 128); /* authored size; see hud_layout.h */
 	  //	ChromeImageNumber = CL_LoadImageOnce("Common\\water2.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE|LIO_TRANSPARENT);
 	}
 	
 	HUDFontsImageNumber = CL_LoadImageOnce("Common\\HUDfonts.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE);
+	HUD_SetAtlasStockSize(HUDFontsImageNumber, 128); /* authored size; see hud_layout.h */
 	SpecialFXImageNumber = CL_LoadImageOnce("Common\\partclfx.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE/*|LIO_TRANSPARENT*/);
+	HUD_SetAtlasStockSize(SpecialFXImageNumber, 256); /* authored size; see hud_layout.h */
 	CloudyImageNumber = CL_LoadImageOnce("Common\\cloudy.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE);
+	HUD_SetAtlasStockSize(CloudyImageNumber, 128); /* authored size; see hud_layout.h */
 	BurningImageNumber = CL_LoadImageOnce("Common\\burn.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE);
+	HUD_SetAtlasStockSize(BurningImageNumber, 128); /* authored size; see hud_layout.h */
 //	RebellionLogoImageNumber = CL_LoadImageOnce("Common\\logo.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE|LIO_TRANSPARENT);
 //	FoxLogoImageNumber = CL_LoadImageOnce("Common\\foxlogo.RIM",LIO_D3DTEXTURE|LIO_RELATIVEPATH|LIO_RESTORABLE|LIO_TRANSPARENT);
 	
@@ -321,7 +383,7 @@ void LoadCommonTextures(void)
 
 }
 
-#ifdef __ANDROID__
+#ifdef AVP_XR
 extern "C" {
 	int VR_IsIn3DMode(void);
 	extern VIEWDESCRIPTORBLOCK *Global_VDB_Ptr;
@@ -343,7 +405,7 @@ void D3D_BLTMotionTrackerToHUD(int scanLineSize)
 
 	{
 		int yaw = Player->ObEuler.EulerY;
-		#ifdef __ANDROID__
+		#ifdef AVP_XR
 		/* In VR the body doesn't turn with the head, so the tracker dish graphic never
 		 * spins to match where the player looks. Use the view yaw (head + snap turn)
 		 * instead - same source as the blip rotation so dish and blips stay aligned.

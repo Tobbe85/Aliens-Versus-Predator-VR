@@ -87,7 +87,12 @@ typedef struct
 	unsigned char VRRefreshRateIndex : 2;
 	unsigned char MSAASampleIndex : 2;
 	unsigned char VRTurnMode : 1; //VR turning: 0=snap, 1=smooth (was SpareBits)
-	unsigned char FSRQualityIndex; //desktop FSR upscaling: 0=off..4=performance
+	/* Was the desktop FSR upscaling level, removed when FSR was replaced by MSAA
+	   (MSAASampleIndex above now drives desktop and PCVR too). Kept as a reserved
+	   byte rather than deleted: this struct is written to <gamedir>/user_profiles/
+	   *.prf as a raw blob, so removing a field would shift everything after it and
+	   silently corrupt every existing profile. Reuse it before adding a new byte. */
+	unsigned char ReservedWasFSRQualityIndex;
 	unsigned char VRSnapAngleIndex; //VR snap turn angle: 0=30,1=45,2=60,3=90
 	unsigned char VRSmoothTurnSpeed; //VR smooth turn speed: 0..10
 	unsigned char VRSmoothDeadzone; //VR smooth turn deadzone: 0..10
@@ -100,7 +105,23 @@ typedef struct
 	unsigned char EnemySpeedPredator; //main menu Cheats: predator enemy speed, stored as (10-speed): 0=full speed..10=stopped (was Padding)
 	unsigned char HUDInsetLevel; //Controller Config: "Adjust HUD elements" 0=default,1,2 pull HUD toward centre (was Padding)
 	unsigned char ManualReloadEnabled; //Controller Config: "Manual Reload" 0=off (default), 1=on (was Padding)
-	char Padding[61];
+	/* AV Options texture filtering. All three are index 0 = the port's previous
+	   behaviour, which is required rather than tidy: these come out of Padding,
+	   so every profile written before they existed has zeroes here. See the
+	   matching note in opengl.c for why the anisotropy list counts down. */
+	unsigned char AnisotropicFilterIndex; //0=16x (default), 1=8x, 2=4x, 3=2x, 4=off (was Padding)
+	unsigned char TextureFilterIndex;     //0=trilinear (default), 1=bilinear, 2=nearest (was Padding)
+	unsigned char NPOTMipmapsEnabled;     //0=off (default), 1=on (was Padding)
+	/* VR refresh rate as an actual RATE in Hz (72, 90, 120, 144, 240 ... all fit
+	   a byte), NOT as an index into the menu list. The list is enumerated from
+	   the headset now, so it differs per device — an index would silently select
+	   a different rate on a headset with a different list, and would break again
+	   every time Meta adds one. 0 = unset, which picks 72 Hz if offered. The old
+	   2-bit VRRefreshRateIndex bitfield above is now unused; it is left in place
+	   because this struct is written as a raw blob and removing it would shift
+	   every field after it. */
+	unsigned char VRRefreshRateHz;        //0 = unset (was Padding)
+	char Padding[57];
 
 	int CDPlayerVolume;
 

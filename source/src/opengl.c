@@ -120,265 +120,194 @@ void InitGameShader(void)
 }
 
 #ifndef __ANDROID__
-// ── FSR 1 (desktop spatial upscaling) ────────────────────────────────────────
-// The in-game frame is rendered into fsr_render_* (low-res), EASU-upscaled into
-// fsr_easu_* (window-res), then RCAS-sharpened to the backbuffer at present.
-// All gated by FSRQualityIndex; when off, FSR_BeginFrame/FSR_Resolve are no-ops.
+// ── Desktop MSAA (multisampled offscreen + blit resolve) ─────────────────────
+// The in-game frame is rendered into a multisampled FBO at window resolution and
+// blitted down onto the backbuffer at present time. This replaced the FSR 1
+// spatial upscaler, which hooked exactly the same three points in the frame
+// (begin / resolve / abort), so the call sites are unchanged apart from names.
+//
+// Uses CORE GL 3.0 glRenderbufferStorageMultisample + glBlitFramebuffer — loaded
+// as function pointers in oglfunc.c — and deliberately NOT the tiled-GPU
+// GL_EXT_multisampled_render_to_texture that the Quest eye pass uses, which
+// desktop drivers do not expose. The two paths therefore share the menu setting
+// (MSAASampleIndex) but not the implementation.
+//
+// Everything degrades to native rendering rather than failing: if the entry
+// points are missing, GL_MAX_SAMPLES is 0, or the FBO comes back incomplete,
+// msaa_unsupported latches and MSAA_BeginFrame becomes a no-op for the session.
 
-extern int   FSRQualityIndex;     // 0=off..4 (main.c)
-extern float FSR_RenderScale(void);
+extern int MSAA_SampleCount(void);   // menu setting -> 0 / 2 / 4 (main.c)
 
-static GLuint fsr_render_fbo = 0, fsr_render_color = 0, fsr_render_depth = 0;
-static GLuint fsr_easu_fbo   = 0, fsr_easu_color   = 0;
-static int    fsr_render_w = 0, fsr_render_h = 0;   // current low-res
-static int    fsr_out_w    = 0, fsr_out_h    = 0;   // window size
-static int    fsr_built_w  = 0, fsr_built_h  = 0;   // size the FBOs were built at
-static int    fsr_built_q  = -1;                    // quality the FBOs were built at
-static int    fsr_frame_active = 0;
+/* GL 3.0 tokens. SDL_opengl.h pulls in SDL_opengl_glext.h which defines these,
+   but the Windows opengl32 gl.h alone stops at 1.1 — define them defensively so
+   this file cannot depend on which header won. */
+#ifndef GL_READ_FRAMEBUFFER
+#define GL_READ_FRAMEBUFFER  0x8CA8
+#endif
+#ifndef GL_DRAW_FRAMEBUFFER
+#define GL_DRAW_FRAMEBUFFER  0x8CA9
+#endif
+#ifndef GL_MAX_SAMPLES
+#define GL_MAX_SAMPLES       0x8D57
+#endif
+#ifndef GL_MULTISAMPLE
+#define GL_MULTISAMPLE       0x809D
+#endif
+#ifndef GL_DEPTH24_STENCIL8
+#define GL_DEPTH24_STENCIL8  0x88F0
+#endif
+#ifndef GL_RGBA8
+#define GL_RGBA8             0x8058
+#endif
 
-static GLuint fsr_easu_prog = 0, fsr_rcas_prog = 0;
-static GLuint fsr_quad_vbo  = 0;
-static GLint  fsr_easu_uTex = -1, fsr_easu_uInSize = -1, fsr_easu_uOutSize = -1;
-static GLint  fsr_rcas_uTex = -1, fsr_rcas_uInSize = -1;
+static GLuint msaa_fbo = 0, msaa_color_rb = 0, msaa_depth_rb = 0;
+static int    msaa_out_w = 0, msaa_out_h = 0;               /* window size */
+static int    msaa_built_w = 0, msaa_built_h = 0;
+static int    msaa_built_samples = -1;
+static int    msaa_frame_active = 0;
+static int    msaa_unsupported = 0;
+static int    msaa_max_samples = -1;
 
-// Fullscreen triangle, position in clip space + UV.
-static const char *fsr_vs =
-    "#version 100\n"
-    "attribute vec2 aPos;\n"
-    "attribute vec2 aUV;\n"
-    "varying vec2 vUV;\n"
-    "void main(){ vUV = aUV; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
-
-// EASU pass: edge-adaptive sharpened upscale with an anti-ringing clamp.
-// (FSR 1 in spirit — edge-aware + neighbourhood clamp — not the bit-exact AMD
-//  EASU kernel; written for GLSL ES 1.00 and easy to swap for the full kernel.)
-static const char *fsr_easu_fs =
-    "#version 100\n"
-    "precision highp float;\n"
-    "varying vec2 vUV;\n"
-    "uniform sampler2D uTex;\n"
-    "uniform vec2 uInSize;\n"   // low-res source size (px)
-    "uniform vec2 uOutSize;\n"  // window size (px) — reserved
-    "float luma(vec3 c){ return dot(c, vec3(0.299,0.587,0.114)); }\n"
-    "void main(){\n"
-    "  vec2 ipx = 1.0/uInSize;\n"
-    "  vec2 pos = vUV*uInSize - 0.5;\n"
-    "  vec2 fp  = floor(pos);\n"
-    "  vec2 f   = pos - fp;\n"
-    "  vec2 uv  = (fp + 0.5)*ipx;\n"
-    // inner 2x2 quad
-    "  vec3 e=texture2D(uTex,uv).rgb;\n"
-    "  vec3 g=texture2D(uTex,uv+vec2( 1.0, 0.0)*ipx).rgb;\n"
-    "  vec3 j=texture2D(uTex,uv+vec2( 0.0, 1.0)*ipx).rgb;\n"
-    "  vec3 k=texture2D(uTex,uv+vec2( 1.0, 1.0)*ipx).rgb;\n"
-    // surrounding ring (8 taps) for edge detection + anti-ringing bounds
-    "  vec3 b=texture2D(uTex,uv+vec2( 0.0,-1.0)*ipx).rgb;\n"
-    "  vec3 c=texture2D(uTex,uv+vec2( 1.0,-1.0)*ipx).rgb;\n"
-    "  vec3 d=texture2D(uTex,uv+vec2(-1.0, 0.0)*ipx).rgb;\n"
-    "  vec3 h=texture2D(uTex,uv+vec2( 2.0, 0.0)*ipx).rgb;\n"
-    "  vec3 i=texture2D(uTex,uv+vec2(-1.0, 1.0)*ipx).rgb;\n"
-    "  vec3 l=texture2D(uTex,uv+vec2( 2.0, 1.0)*ipx).rgb;\n"
-    "  vec3 m=texture2D(uTex,uv+vec2( 0.0, 2.0)*ipx).rgb;\n"
-    "  vec3 n=texture2D(uTex,uv+vec2( 1.0, 2.0)*ipx).rgb;\n"
-    "  vec3 bilin = mix(mix(e,g,f.x), mix(j,k,f.x), f.y);\n"
-    "  vec3 mn = min(min(min(e,g),min(j,k)), min(min(d,h),min(i,l)));\n"
-    "  vec3 mx = max(max(max(e,g),max(j,k)), max(max(d,h),max(i,l)));\n"
-    "  vec3 ring = (b+c+d+h+i+l+m+n) * 0.125;\n"
-    "  float edge = clamp(luma(mx)-luma(mn), 0.0, 1.0);\n"
-    "  vec3 col = bilin + (bilin - ring) * (0.5*edge);\n"  // edge-adaptive sharpen
-    "  gl_FragColor = vec4(clamp(col, mn, mx), 1.0);\n"     // anti-ringing clamp
-    "}\n";
-
-// RCAS pass: contrast-adaptive sharpening with a local min/max clamp (FSR 1 style).
-static const char *fsr_rcas_fs =
-    "#version 100\n"
-    "precision highp float;\n"
-    "varying vec2 vUV;\n"
-    "uniform sampler2D uTex;\n"
-    "uniform vec2 uInSize;\n"   // = output (full) size for RCAS
-    "void main(){\n"
-    "  vec2 px = 1.0/uInSize;\n"
-    "  vec3 e = texture2D(uTex, vUV).rgb;\n"
-    "  vec3 n = texture2D(uTex, vUV+vec2(0.0,-1.0)*px).rgb;\n"
-    "  vec3 s = texture2D(uTex, vUV+vec2(0.0, 1.0)*px).rgb;\n"
-    "  vec3 w = texture2D(uTex, vUV+vec2(-1.0,0.0)*px).rgb;\n"
-    "  vec3 ee= texture2D(uTex, vUV+vec2( 1.0,0.0)*px).rgb;\n"
-    "  vec3 mn = min(e, min(min(n,s), min(w,ee)));\n"
-    "  vec3 mx = max(e, max(max(n,s), max(w,ee)));\n"
-    "  const float sharp = 0.25;\n"   // 0 = none .. ~0.5 = strong
-    "  vec3 res = e + (e*4.0 - n - s - w - ee) * sharp;\n"
-    "  gl_FragColor = vec4(clamp(res, mn, mx), 1.0);\n"
-    "}\n";
-
-static GLuint fsr_link(const char *vs_src, const char *fs_src)
+static void msaa_release(void)
 {
-    GLuint vs = compile_game_shader(GL_VERTEX_SHADER,   vs_src);
-    GLuint fs = compile_game_shader(GL_FRAGMENT_SHADER, fs_src);
-    GLuint p  = glCreateProgram();
-    glAttachShader(p, vs);
-    glAttachShader(p, fs);
-    glBindAttribLocation(p, 0, "aPos");
-    glBindAttribLocation(p, 1, "aUV");
-    glLinkProgram(p);
-    GLint linked = 0; glGetProgramiv(p, GL_LINK_STATUS, &linked);
-    if (!linked) { char log[512]; glGetProgramInfoLog(p, sizeof(log), NULL, log);
-                   fprintf(stderr, "FSR shader link error: %s\n", log); }
-    glDeleteShader(vs); glDeleteShader(fs);
-    return p;
+    if (msaa_fbo)      { glDeleteFramebuffers(1,  &msaa_fbo);      msaa_fbo      = 0; }
+    if (msaa_color_rb) { glDeleteRenderbuffers(1, &msaa_color_rb); msaa_color_rb = 0; }
+    if (msaa_depth_rb) { glDeleteRenderbuffers(1, &msaa_depth_rb); msaa_depth_rb = 0; }
+    msaa_built_w = msaa_built_h = 0;
+    msaa_built_samples = -1;
 }
 
-static void fsr_init_once(void)
+/* (Re)create the multisampled colour+depth target. Returns the sample count
+   actually built (0 = give up and render natively). */
+static int msaa_build_targets(int samples)
 {
-    if (fsr_quad_vbo) return;
-    fsr_easu_prog = fsr_link(fsr_vs, fsr_easu_fs);
-    fsr_easu_uTex     = glGetUniformLocation(fsr_easu_prog, "uTex");
-    fsr_easu_uInSize  = glGetUniformLocation(fsr_easu_prog, "uInSize");
-    fsr_easu_uOutSize = glGetUniformLocation(fsr_easu_prog, "uOutSize");
-    fsr_rcas_prog = fsr_link(fsr_vs, fsr_rcas_fs);
-    fsr_rcas_uTex    = glGetUniformLocation(fsr_rcas_prog, "uTex");
-    fsr_rcas_uInSize = glGetUniformLocation(fsr_rcas_prog, "uInSize");
+    msaa_release();
 
-    // Fullscreen triangle: clip-space xy + uv.
-    const float quad[] = {
-        -1.0f, -1.0f,  0.0f, 0.0f,
-         3.0f, -1.0f,  2.0f, 0.0f,
-        -1.0f,  3.0f,  0.0f, 2.0f,
-    };
-    glGenBuffers(1, &fsr_quad_vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, fsr_quad_vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-}
+    if (msaa_max_samples < 0) {
+        GLint maxs = 0;
+        glGetIntegerv(GL_MAX_SAMPLES, &maxs);
+        msaa_max_samples = (int)maxs;
+        SDL_Log("MSAA: GL_MAX_SAMPLES = %d", msaa_max_samples);
+    }
+    if (msaa_max_samples <= 1) { msaa_unsupported = 1; return 0; }
+    if (samples > msaa_max_samples) samples = msaa_max_samples;
 
-static GLuint fsr_make_color(int w, int h)
-{
-    GLuint t; glGenTextures(1, &t);
-    glBindTexture(GL_TEXTURE_2D, t);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    return t;
-}
+    glGenFramebuffers(1, &msaa_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, msaa_fbo);
 
-static void fsr_destroy_targets(void)
-{
-    if (fsr_render_fbo)   { glDeleteFramebuffers(1, &fsr_render_fbo);   fsr_render_fbo = 0; }
-    if (fsr_render_color) { glDeleteTextures(1, &fsr_render_color);     fsr_render_color = 0; }
-    if (fsr_render_depth) { glDeleteRenderbuffers(1, &fsr_render_depth); fsr_render_depth = 0; }
-    if (fsr_easu_fbo)     { glDeleteFramebuffers(1, &fsr_easu_fbo);     fsr_easu_fbo = 0; }
-    if (fsr_easu_color)   { glDeleteTextures(1, &fsr_easu_color);       fsr_easu_color = 0; }
-}
+    glGenRenderbuffers(1, &msaa_color_rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, msaa_color_rb);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, msaa_out_w, msaa_out_h);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, msaa_color_rb);
 
-static int fsr_build_targets(void)
-{
-    float scale = FSR_RenderScale();
-    fsr_render_w = (int)(fsr_out_w / scale + 0.5f);
-    fsr_render_h = (int)(fsr_out_h / scale + 0.5f);
-    if (fsr_render_w < 1 || fsr_render_h < 1) return 0;
+    glGenRenderbuffers(1, &msaa_depth_rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, msaa_depth_rb);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, msaa_out_w, msaa_out_h);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, msaa_depth_rb);
 
-    fsr_destroy_targets();
-
-    // Low-res render target: colour texture + depth/stencil renderbuffer.
-    fsr_render_color = fsr_make_color(fsr_render_w, fsr_render_h);
-    glGenRenderbuffers(1, &fsr_render_depth);
-    glBindRenderbuffer(GL_RENDERBUFFER, fsr_render_depth);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, fsr_render_w, fsr_render_h);
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     glBindRenderbuffer(GL_RENDERBUFFER, 0);
-    glGenFramebuffers(1, &fsr_render_fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, fsr_render_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fsr_render_color, 0);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, fsr_render_depth);
-
-    // EASU output target: full window-res colour.
-    fsr_easu_color = fsr_make_color(fsr_out_w, fsr_out_h);
-    glGenFramebuffers(1, &fsr_easu_fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, fsr_easu_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fsr_easu_color, 0);
-
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    fsr_built_w = fsr_out_w; fsr_built_h = fsr_out_h; fsr_built_q = FSRQualityIndex;
-    SDL_Log("FSR: targets %dx%d -> %dx%d (q=%d, scale=%.2f)",
-            fsr_render_w, fsr_render_h, fsr_out_w, fsr_out_h, FSRQualityIndex, scale);
-    return 1;
-}
-
-static void fsr_draw_fullscreen(void)
-{
-    glBindBuffer(GL_ARRAY_BUFFER, fsr_quad_vbo);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)(2*sizeof(float)));
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    glDisableVertexAttribArray(0);
-    glDisableVertexAttribArray(1);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-}
-
-void FSR_SetOutputSize(int w, int h)
-{
-    fsr_out_w = w; fsr_out_h = h;
-}
-
-void FSR_BeginFrame(void)
-{
-    fsr_frame_active = 0;
-    if (FSRQualityIndex <= 0 || fsr_out_w <= 0 || fsr_out_h <= 0) return;
-
-    fsr_init_once();
-    if (fsr_render_fbo == 0 || fsr_built_w != fsr_out_w || fsr_built_h != fsr_out_h
-            || fsr_built_q != FSRQualityIndex) {
-        if (!fsr_build_targets()) return;
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        SDL_Log("MSAA: %dx FBO incomplete (0x%x) — falling back to native rendering",
+                samples, (unsigned)status);
+        msaa_release();
+        msaa_unsupported = 1;
+        return 0;
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, fsr_render_fbo);
-    glViewport(0, 0, fsr_render_w, fsr_render_h);
-    fsr_frame_active = 1;
+    msaa_built_w = msaa_out_w; msaa_built_h = msaa_out_h; msaa_built_samples = samples;
+    SDL_Log("MSAA: %dx target ready at %dx%d", samples, msaa_out_w, msaa_out_h);
+    return samples;
 }
 
-void FSR_Resolve(void)
+/* Window (backbuffer) size — call on create and on resize. */
+void MSAA_SetOutputSize(int w, int h)
 {
-    if (!fsr_frame_active) return;
-    fsr_frame_active = 0;
-
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-    glDisable(GL_CULL_FACE);
-    glActiveTexture(GL_TEXTURE0);
-
-    // Pass 1: EASU  low-res -> full-res (fsr_easu_fbo)
-    glBindFramebuffer(GL_FRAMEBUFFER, fsr_easu_fbo);
-    glViewport(0, 0, fsr_out_w, fsr_out_h);
-    glUseProgram(fsr_easu_prog);
-    glBindTexture(GL_TEXTURE_2D, fsr_render_color);
-    glUniform1i(fsr_easu_uTex, 0);
-    glUniform2f(fsr_easu_uInSize,  (float)fsr_render_w, (float)fsr_render_h);
-    glUniform2f(fsr_easu_uOutSize, (float)fsr_out_w,    (float)fsr_out_h);
-    fsr_draw_fullscreen();
-
-    // Pass 2: RCAS  full-res -> backbuffer
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, fsr_out_w, fsr_out_h);
-    glUseProgram(fsr_rcas_prog);
-    glBindTexture(GL_TEXTURE_2D, fsr_easu_color);
-    glUniform1i(fsr_rcas_uTex, 0);
-    glUniform2f(fsr_rcas_uInSize, (float)fsr_out_w, (float)fsr_out_h);
-    fsr_draw_fullscreen();
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glUseProgram(0);
+    msaa_out_w = w; msaa_out_h = h;
 }
 
-void FSR_AbortFrame(void)
+void MSAA_BeginFrame(void)
 {
-    if (!fsr_frame_active) return;
-    fsr_frame_active = 0;
+    msaa_frame_active = 0;
+
+    int samples = MSAA_SampleCount();
+    if (samples <= 0 || msaa_unsupported) return;
+    if (msaa_out_w <= 0 || msaa_out_h <= 0) return;
+    /* The pointers are NULL on a context too old for GL 3.0 FBO blits. */
+    if (!pfn_glRenderbufferStorageMultisample || !pfn_glBlitFramebuffer) {
+        SDL_Log("MSAA: glRenderbufferStorageMultisample/glBlitFramebuffer unavailable");
+        msaa_unsupported = 1;
+        return;
+    }
+
+    if (msaa_fbo == 0 || msaa_built_w != msaa_out_w || msaa_built_h != msaa_out_h
+            || msaa_built_samples != samples) {
+        if (!msaa_build_targets(samples)) return;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, msaa_fbo);
+    glViewport(0, 0, msaa_out_w, msaa_out_h);
+    glEnable(GL_MULTISAMPLE);
+
+    /* Clear the target before the frame is drawn into it.
+     *
+     * This is NOT optional here, even though the engine never clears the colour
+     * buffer in normal play (it relies on the BSP world covering every pixel).
+     * The default framebuffer gets away with that; a persistent single-buffered
+     * FBO does not, because several of the engine's blend modes read the
+     * DESTINATION colour — GL_DST_COLOR/GL_ONE and GL_ONE_MINUS_DST_COLOR are
+     * what the HUD and translucency levels use. Left uncleared, each frame's HUD
+     * blends against the previous frame's HUD instead of against fresh world
+     * pixels, so it compounds: brighter every frame, with the older copies still
+     * visible underneath. It looks correct only where something opaque (the
+     * weapon and hands) overwrites the destination first and breaks the loop.
+     *
+     * The VR eye pass has always done exactly this clear per eye (avpview.c),
+     * which is why MSAA looked right in the headset and wrong on the flat build.
+     *
+     * The two smear cheats deliberately reuse the previous frame's image, so
+     * honour them the same way D3D_DrawBackdrop does and skip the colour clear —
+     * depth still has to go. */
+    glDepthMask(GL_TRUE);   /* a masked-off depth write silently voids the clear */
+    if (TRIPTASTIC_CHEATMODE || MOTIONBLUR_CHEATMODE) {
+        glClear(GL_DEPTH_BUFFER_BIT);
+    } else {
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    }
+
+    msaa_frame_active = 1;
+}
+
+/* Resolve the multisampled frame onto the backbuffer. Called immediately before
+   the buffer swap. */
+void MSAA_Resolve(void)
+{
+    if (!msaa_frame_active) return;
+    msaa_frame_active = 0;
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, msaa_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    /* Same dimensions both sides, so this is a pure downsample — GL_NEAREST is
+       required for a multisample resolve blit with matching rectangles. */
+    glBlitFramebuffer(0, 0, msaa_out_w, msaa_out_h,
+                      0, 0, msaa_out_w, msaa_out_h,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, fsr_out_w, fsr_out_h);
+    glViewport(0, 0, msaa_out_w, msaa_out_h);
+}
+
+/* Drop a begun frame back to the backbuffer without resolving — the menu/2D
+   present path, which must draw to the window rather than into our FBO. */
+void MSAA_AbortFrame(void)
+{
+    if (!msaa_frame_active) return;
+    msaa_frame_active = 0;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, msaa_out_w, msaa_out_h);
 }
 #endif // !__ANDROID__
 
@@ -407,8 +336,90 @@ static D3DTexture *CurrTextureHandle;
 
 static enum TRANSLUCENCY_TYPE CurrentTranslucencyMode = TRANSLUCENCY_OFF;
 static enum FILTERING_MODE_ID CurrentFilteringMode = FILTERING_BILINEAR_OFF;
-static GLenum TextureMinFilter = GL_LINEAR_MIPMAP_LINEAR;
 static D3DTexture *CurrentlyBoundTexture = NULL;
+
+/* --- Texture filtering settings (AV Options) ------------------------------
+   All three default to 0, and 0 is deliberately the behaviour the port had
+   before they existed. That matters because they are stored in spare bytes of
+   the profile blob (see avp_userprofile.h): an existing .prf has zeroes there,
+   so a zero MUST decode to the old default or upgrading would silently change
+   everyone's settings. It is the same reason EnemySpeed* is stored as
+   (10 - speed).
+
+   That constraint is why the anisotropy slider counts DOWN (16x first). Every
+   other TEXTSLIDER in the frontend also puts its default at index 0, so this
+   matches the house style rather than fighting it; MSAA is the one exception,
+   and it gets away with it only because it owns a real bitfield that
+   SetDefaultUserProfile writes explicitly. */
+int AnisotropicFilterIndex = 0; /* 0=16x(default) 1=8x 2=4x 3=2x 4=off        */
+int TextureFilterIndex     = 0; /* 0=trilinear(default) 1=bilinear 2=nearest  */
+int NPOTMipmapsEnabled     = 0; /* 0=off(default) 1=on                        */
+
+/* Whether this texture actually has usable mip levels. glGenerateMipmap runs
+   for every texture, but NPOT ones are padded up to a power of two and their
+   padding bleeds into the lower levels, which is why they were pinned to
+   GL_LINEAR. The padding is now edge-replicated (see the upload below), so
+   they can opt in. */
+static int TexHasMipmaps(const D3DTexture *tex)
+{
+	if (!tex) return 1;
+	return (!tex->IsNpot) || NPOTMipmapsEnabled;
+}
+
+static GLenum TexMinFilter(int hasMipmaps)
+{
+	switch (TextureFilterIndex) {
+		case 2:  return GL_NEAREST;
+		case 1:  return hasMipmaps ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR;
+		default: return hasMipmaps ? GL_LINEAR_MIPMAP_LINEAR  : GL_LINEAR;
+	}
+}
+
+/* "Nearest" has to take the magnification filter too, or textures still smooth
+   out as you walk up to them and the setting looks broken. */
+static GLenum TexMagFilter(void)
+{
+	return (TextureFilterIndex == 2) ? GL_NEAREST : GL_LINEAR;
+}
+
+/* Requested anisotropy, clamped to what the driver offers. Index 0 asks for
+   16x, which is what GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT reports on essentially
+   every desktop GPU and on Adreno, so it reproduces the old "always maximum"
+   behaviour. A driver advertising more than 16 would previously have used it;
+   the difference above 16x is not visible. */
+static GLfloat TexAnisotropy(void)
+{
+	GLfloat maxAniso = 1.0f;
+	GLfloat want;
+
+	if (!ogl_use_texture_filter_anisotropic)
+		return 1.0f;
+
+	pglGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAniso);
+
+	switch (AnisotropicFilterIndex) {
+		case 1:  want = 8.0f;  break;
+		case 2:  want = 4.0f;  break;
+		case 3:  want = 2.0f;  break;
+		case 4:  want = 1.0f;  break; /* off */
+		default: want = 16.0f; break;
+	}
+
+	if (want > maxAniso) want = maxAniso;
+	if (want < 1.0f)     want = 1.0f;
+
+	return want;
+}
+
+/* Apply the current settings to a texture that is already bound. */
+static void ApplyFilterToBoundTexture(D3DTexture *tex)
+{
+	pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, TexMagFilter());
+	pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, TexMinFilter(TexHasMipmaps(tex)));
+
+	if (ogl_use_texture_filter_anisotropic)
+		pglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, TexAnisotropy());
+}
 
 /* VR HUD clip-space controls — active only during MaintainHUD() in VR.
    vr_hud_clip_scale: < 1.0 shrinks the HUD toward centre (1.0 = no scale).
@@ -459,6 +470,40 @@ static int starrc;
 void OGL_RegenerateMipmaps(void)
 {
 	glGenerateMipmap(GL_TEXTURE_2D);
+}
+
+/* Push the current texture filtering settings onto every resident texture.
+   Mip levels are already present on all of them (glGenerateMipmap runs at
+   upload regardless), so switching between trilinear/bilinear/nearest and
+   toggling NPOT mipmaps is a filter change only — nothing has to be re-uploaded
+   and no level reload is needed. */
+static void FlushTriangleBuffers(int backup); /* defined further down */
+
+void OGL_ApplyTextureFilterSettings(void)
+{
+	extern int NumImages;
+	int i;
+
+	FlushTriangleBuffers(1);
+
+	for (i = 0; i < NumImages; i++) {
+		D3DTexture *tex = ImageHeaderArray[i].D3DTexture;
+
+		if (!tex || !tex->id)
+			continue;
+
+		pglBindTexture(GL_TEXTURE_2D, tex->id);
+		ApplyFilterToBoundTexture(tex);
+
+		/* Record what is actually on the object, so CheckBoundTextureIsCorrect
+		   only re-applies when the per-draw mode genuinely differs. */
+		tex->filter = FILTERING_BILINEAR_ON;
+	}
+
+	/* Force the next bind to go through the normal path rather than trusting a
+	   cache that no longer reflects what is bound. */
+	CurrentlyBoundTexture = NULL;
+	pglBindTexture(GL_TEXTURE_2D, 0);
 }
 
 // In opengl.c — call this to re-bind game shader attribs after any external blit
@@ -657,16 +702,15 @@ static void CheckBoundTextureIsCorrect(D3DTexture *tex)
 				pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 				break;
 			case FILTERING_BILINEAR_ON:
-				pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-				pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, TextureMinFilter);
+				ApplyFilterToBoundTexture(tex);
 				break;
 			default:
 				break;
 		}
-		
+
 		tex->filter = CurrentFilteringMode;
 	}
-	
+
 	CurrentlyBoundTexture = tex;
 }
 
@@ -683,13 +727,12 @@ static void CheckFilteringModeIsCorrect(enum FILTERING_MODE_ID filter)
 				pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 				break;
 			case FILTERING_BILINEAR_ON:
-				pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-				pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, TextureMinFilter);
+				ApplyFilterToBoundTexture(CurrentlyBoundTexture);
 				break;
 			default:
 				break;
 		}
-		
+
 		CurrentlyBoundTexture->filter = CurrentFilteringMode;
 	}
 }
@@ -853,9 +896,9 @@ GLuint CreateOGLTexture(D3DTexture *tex, unsigned char *buf)
 	int PotHeight = PowerOfTwo(tex->TexHeight);
 	tex->IsNpot = (PotWidth != tex->TexWidth) || (PotHeight != tex->TexHeight);
 
+
 	GLuint h;
-	GLfloat max_anisotropy;
-	
+
 	FlushTriangleBuffers(1);
 
 	pglGenTextures(1, &h);
@@ -871,18 +914,33 @@ GLuint CreateOGLTexture(D3DTexture *tex, unsigned char *buf)
         tex->TexWidth = PotWidth;
         tex->TexHeight = PotHeight;
 
-		pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-
 		/* Allocate with zeroed padding so rows beyond tex->h aren't raw VRAM garbage */
 		int padBytes = tex->TexWidth * tex->TexHeight * 4;
 		unsigned char *padBuf = calloc(1, padBytes);
 		if (padBuf) {
-			int row;
+			int row, col;
 			for (row = 0; row < tex->h; row++)
 				memcpy(padBuf + row * tex->TexWidth * 4,
 				       buf    + row * tex->w       * 4,
 				       tex->w * 4);
+
+			/* Extend the last real column and row across the padding instead of
+			   leaving it black. Zeroed padding is invisible at mip 0 (nothing
+			   samples past tex->w/h) but averages into every lower mip level as
+			   a dark fringe, which is what made mipmapping these unusable. With
+			   the edge replicated the lower levels stay the colour of the image,
+			   so the NPOT Texture Mipmaps option is worth having. */
+			for (row = 0; row < tex->h; row++) {
+				unsigned char *rowBase = padBuf + row * tex->TexWidth * 4;
+				const unsigned char *lastPx = rowBase + (tex->w - 1) * 4;
+				for (col = tex->w; col < (int)tex->TexWidth; col++)
+					memcpy(rowBase + col * 4, lastPx, 4);
+			}
+			for (row = tex->h; row < (int)tex->TexHeight; row++)
+				memcpy(padBuf + row * tex->TexWidth * 4,
+				       padBuf + (tex->h - 1) * tex->TexWidth * 4,
+				       tex->TexWidth * 4);
+
 			pglTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tex->TexWidth, tex->TexHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, padBuf);
 			free(padBuf);
 		} else {
@@ -891,9 +949,6 @@ GLuint CreateOGLTexture(D3DTexture *tex, unsigned char *buf)
 		}
 		glGenerateMipmap(GL_TEXTURE_2D);
     } else {
-		pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		pglTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, TextureMinFilter);
-
 		pglTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tex->w, tex->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
 		glGenerateMipmap(GL_TEXTURE_2D);
 	}
@@ -906,12 +961,11 @@ GLuint CreateOGLTexture(D3DTexture *tex, unsigned char *buf)
 	tex->RecipW = 1.0f / (float) tex->TexWidth;
 	tex->RecipH = 1.0f / (float) tex->TexHeight;
 
-	if ( ogl_use_texture_filter_anisotropic )
-	{
-		pglGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &max_anisotropy);
-		pglTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, max_anisotropy);
-	}
-	
+	/* Filters and anisotropy come from the AV Options settings, and are applied
+	   after tex->IsNpot is known so the NPOT mipmap choice can be honoured. */
+	ApplyFilterToBoundTexture(tex);
+
+
 	if ( CurrentlyBoundTexture != NULL )
 	{
 		/* restore the previously-bound texture */
@@ -961,14 +1015,43 @@ void ReleaseDDSurface(void* DDSurface)
 
 void ThisFramesRenderingHasBegun()
 {
+	/* Texture filter parameters live on the texture objects, which are created
+	   once at level load, so a change in AV Options has to be pushed out to
+	   everything already resident. Polling three ints here rather than hooking
+	   the menu catches every route the values can change by — the sliders, a
+	   profile load, or "Use these settings" — with no menu-side plumbing. */
+	{
+		static int appliedAniso  = -1;
+		static int appliedFilter = -1;
+		static int appliedNpot   = -1;
+
+		if (appliedAniso  != AnisotropicFilterIndex ||
+		    appliedFilter != TextureFilterIndex     ||
+		    appliedNpot   != NPOTMipmapsEnabled) {
+
+			OGL_ApplyTextureFilterSettings();
+
+			appliedAniso  = AnisotropicFilterIndex;
+			appliedFilter = TextureFilterIndex;
+			appliedNpot   = NPOTMipmapsEnabled;
+		}
+	}
+
 	CheckFilteringModeIsCorrect(FILTERING_BILINEAR_ON);
 	RestoreGameShaderState();
-#ifdef __ANDROID__
-	VR_Set2DViewport();
-#else
-	/* Desktop: when FSR is enabled, redirect the in-game frame into the low-res
-	   render target. No-op (native rendering) when FSR is off. */
-	FSR_BeginFrame();
+#ifdef AVP_XR
+	VR_Set2DViewport(); /* no-op unless an XR session is presenting in 2D mode */
+#endif
+#ifndef __ANDROID__
+	/* Desktop: when MSAA is enabled, redirect the frame into the multisampled
+	   target. No-op (native rendering) when it is off. On PCVR, stand down while
+	   the headset owns the frame — the eye pass does its own MSAA into the XR
+	   swapchain (avpview.c), and binding an FBO here would hijack it. */
+	{
+		extern int VR_SessionActive(void);
+		if (!VR_SessionActive())
+			MSAA_BeginFrame();
+	}
 #endif
 }
 
@@ -2037,6 +2120,80 @@ void D3D_HUD_Setup()
 	pglDepthFunc(GL_LEQUAL);	
 }
 
+/* How much larger the loaded atlas is than the size its UVs were authored for.
+ *
+ * Every UV the HUD code emits is an ABSOLUTE PIXEL COORDINATE in a fixed stock
+ * atlas — the Marine HUD's tracker spans 1..129, its blue bar starts at V=223,
+ * its gunsight sits at U=227, all against a 256x256 MarineHUD.RIM. An HD texture
+ * pack (HD Redux ships a 1024x1024 replacement) leaves those numbers describing
+ * a quarter of the image, so every element samples a sub-rectangle and renders
+ * magnified. Returning actual/stock lets the caller rescale its UVs to match
+ * whatever was actually loaded, which works for any pack rather than one.
+ *
+ * Read from the D3DTexture rather than IMAGEHEADER::ImageWidth: the header's
+ * dimensions are not reliably populated at the point the HUD sets itself up,
+ * whereas the texture object is valid by the time anything is drawn. Returns
+ * ONE_FIXED (no scaling) if the texture is not resolvable, so a missing or
+ * stock-sized atlas behaves exactly as before.
+ *
+ * 16.16 fixed point, to match the MUL_FIXED the callers use. */
+/* Per-atlas authored ("stock") size, registered by d3d_hud.cpp as each HUD atlas
+   is loaded. 0 = not registered = do not rescale.
+
+   This MUST be per atlas. It was originally a single global constant of 256,
+   which is right for MarineHUD.RIM but wrong for most of the others that go
+   through Draw_HUDImage: Common\HUDfonts.RIM, Common\static.RIM,
+   HUDs\Alien\AlienTongue.RIM, Common\cloudy.RIM and Common\burn.RIM are all
+   128x128. Against a 256 reference those produced a scale of 0.5 and HALVED
+   their UVs on stock assets, which is what broke the Predator's tri-crosshair
+   (drawn from HUDfonts at U=1,V=51) on every platform. */
+#define HUD_MAX_ATLASES 8
+static struct { int imageNumber; int stockSize; } HUDAtlasStock[HUD_MAX_ATLASES];
+static int HUDAtlasStockCount = 0;
+
+void HUD_SetAtlasStockSize(int imageNumber, int stockSize)
+{
+	int i;
+
+	if (imageNumber < 0 || stockSize <= 0) return;
+
+	for (i = 0; i < HUDAtlasStockCount; i++) {
+		if (HUDAtlasStock[i].imageNumber == imageNumber) {
+			HUDAtlasStock[i].stockSize = stockSize;
+			return;
+		}
+	}
+
+	if (HUDAtlasStockCount < HUD_MAX_ATLASES) {
+		HUDAtlasStock[HUDAtlasStockCount].imageNumber = imageNumber;
+		HUDAtlasStock[HUDAtlasStockCount].stockSize   = stockSize;
+		HUDAtlasStockCount++;
+	}
+}
+
+int HUD_AtlasUVScale(int imageNumber)
+{
+	D3DTexture *tex;
+	int stockSize = 0;
+	int i;
+
+	for (i = 0; i < HUDAtlasStockCount; i++) {
+		if (HUDAtlasStock[i].imageNumber == imageNumber) {
+			stockSize = HUDAtlasStock[i].stockSize;
+			break;
+		}
+	}
+
+	/* Unregistered atlas: leave the UVs exactly as the 1999 code emitted them.
+	   Guessing a reference here is what caused the bug above. */
+	if (stockSize <= 0) return ONE_FIXED;
+
+	tex = ImageHeaderArray[imageNumber].D3DTexture;
+	if (!tex || tex->w == 0) return ONE_FIXED;
+
+	return DIV_FIXED((int)tex->w, stockSize);
+}
+
 void D3D_HUDQuad_Output(int imageNumber, struct VertexTag *quadVerticesPtr, unsigned int colour)
 {
 	float RecipW, RecipH;
@@ -2047,7 +2204,32 @@ void D3D_HUDQuad_Output(int imageNumber, struct VertexTag *quadVerticesPtr, unsi
 
 /* possibly use polygon offset? (predator hud) */
 
-	CheckTriangleBuffer(4, 0, 0, 0, tex, TRANSLUCENCY_GLOWING, -1);
+	/* HUD art is normally point-sampled: -1 leaves the current filtering mode,
+	   which the HUD text path leaves at FILTERING_BILINEAR_OFF (GL_NEAREST).
+	   That is exactly right for a stock atlas, where the quad is drawn 1:1 with
+	   the texels and nearest sampling is lossless.
+
+	   An HD atlas is a different matter. Its UVs get rescaled (see
+	   HUD_AtlasUVScale) so the same 13x13 gunsight now covers 52x52 texels, i.e.
+	   4:1 MINIFICATION — and point-sampling a minified image aliases: it keeps
+	   one texel in every 4x4 block at full weight instead of averaging them.
+	   Measured on HD Redux's 1024x1024 MarineHUD, that rendered the Marine
+	   crosshair with 36 lit pixels against 16 for both stock and retail; box
+	   -downsampling the same HD art gives exactly 16, so the art was never the
+	   problem, only the sampling.
+
+	   So ask for BILINEAR_ON whenever this atlas is being rescaled, which selects
+	   GL_LINEAR + the mip chain (already generated for every texture) and lets
+	   the GPU do the 4:1 downsample properly. A stock-sized atlas still passes
+	   -1 and renders byte-identically to before. */
+	{
+		enum FILTERING_MODE_ID hudFilter = (enum FILTERING_MODE_ID)-1;
+
+		if (HUD_AtlasUVScale(imageNumber) != ONE_FIXED)
+			hudFilter = FILTERING_BILINEAR_ON;
+
+		CheckTriangleBuffer(4, 0, 0, 0, tex, TRANSLUCENCY_GLOWING, hudFilter);
+	}
 	
 	RecipW = tex->RecipW / 65536.0f;
 	RecipH = tex->RecipH / 65536.0f;
