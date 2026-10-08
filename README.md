@@ -1,5 +1,11 @@
 # Aliens Versus Predator: VR and non-VR
 
+> ⚠️ **Notice:**  
+> This fork is no longer being maintained, as **bassquake** added official pico support to his mod.  
+> 👉 Check it out here, it is amazing: https://github.com/Bassquake/Aliens-Versus-Predator-VR
+
+<br><br><br>
+
 > [!TIP]
 > Check the new 0.6 update on releases page. **You will need to reupload the asset files into the new app name folder in Sidequest. Any progress made in earlier builds won't be in the 0.6 build as folder location has changed!** You can keep old builds on headset if you wish to continue playing and not lose your progress but is probably best to start afresh. This build is mainly releases of the flat version for Android devices like phones and TVs, Windows and Linux so they can all multiplay! Aliens wall walking still broken though.
 
